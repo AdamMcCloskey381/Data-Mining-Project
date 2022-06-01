@@ -1,0 +1,233 @@
+### zaladowanie odpowiednich bibliotek
+if (!require("randomForest")) install.packages("randomForest")
+library("randomForest")
+if (!require("dplyr")) install.packages("dplyr")
+library("dplyr")
+if (!require("caret")) install.packages("caret")
+library("caret")
+if (!require("ggplot2")) install.packages("ggplot2")
+library("ggplot2")
+if (!require("pROC"))install.packages("pROC")
+library("pROC")
+
+### zaladowanie danych do data frame
+df <- read.csv("daneDMcsv.csv", header = 1, sep = ";")
+head(df)
+### tranformacja nazw kolumn
+?make.names
+colnames(df)[c(9, 13, 14)] <- c("dayofweek", "conspriceidx", "consconfidx")
+
+### sprawdzenie typów danych
+sapply(df, class)
+summary(df)
+
+# konwersja typow danych
+numeric_col <- list(which(sapply(df, class) == "character", 1))
+
+df$conspriceidx = sub(",", ".", df$conspriceidx)
+df$conspriceidx = as.numeric(df$conspriceidx)
+
+df$consconfidx = sub(",", ".", df$consconfidx)
+df$consconfidx = as.numeric(df$consconfidx)
+
+### sprawdzenie czy wystepuja braki danych, oraz ich usuniecie
+unique(df$marital)
+df[df == "unknown"] <- NA  
+any(is.na(df))
+
+### sprawdzenie rozkladu zmiennych typu integer
+integer_col <- list(which(sapply(df, class) == "integer", 1))
+
+for (i in 1:length(integer_col[[1]])){
+  hist(df[, integer_col[[1]][[i]]],
+       main = colnames(df[integer_col[[1]][[i]]]),
+       xlab = "")  
+}
+### skalowanie zmiennych typu numeric
+?sd
+df$conspriceidx <- (df$conspriceidx - mean(df$conspriceidx))/sd(df$conspriceidx)
+df$consconfidx <- (df$consconfidx - mean(df$consconfidx))/sd(df$consconfidx)
+
+### sprawdzenie rozkladu zmiennych typu numeric
+for (i in 1:length(numeric_col[[1]])){
+  hist(df[, numeric_col[[1]][[i]]],
+       main = colnames(df[numeric_col[[1]][[i]]]),
+       xlab = "")  
+}
+
+### factoring
+for (i in 2:12){
+  df[, i] = factor(df[, i])
+}
+df$y = as.factor(df$y)
+sapply(df, class)
+
+# zmienna age
+?make.names
+
+df <- df %>%
+  mutate(
+    age = case_when(
+      age < 30 ~ "between 19 and 30",
+      age < 41 ~ "between 31 and 40",
+      age < 51 ~ "between 41 and 50", 
+      TRUE     ~ "above 50"
+    )
+  )
+df <- df%>%
+  mutate(
+    y = case_when(
+      y == 0 ~ "no",
+      y == 1 ~ "yes"
+    )
+  )
+
+df$y
+df$age <- as.factor(df$age)
+
+### training the model using caret
+# kryterium wyboru jest krzywa ROC- czyli pole AUC
+
+ctrl <- trainControl(method="cv", 
+                     summaryFunction=twoClassSummary, 
+                     classProbs=TRUE,
+                     search = "grid",
+                     savePredictions = "final",
+                     verboseIter = TRUE)
+
+ctrl_repeated <- trainControl(method="repeatedcv",
+                     number = 10,
+                     repeats = 3,
+                     summaryFunction=twoClassSummary, 
+                     classProbs=TRUE,
+                     search = "grid",
+                     savePredictions = "final",
+                     verboseIter = TRUE)
+
+
+tuneGrid <- expand.grid(.mtry = c(3:6)) 
+                        
+rfFit <- train(x = df[, -15], y = df[, 15], 
+               method="rf",  
+               trControl=ctrl_repeated,
+               metric = "Accuracy",
+               tuneGrid = tuneGrid,
+               maximize = TRUE)
+rfFit$bestTune[[1]]
+
+# dla ntree = 500
+trellis.par.set(caretTheme())
+
+ggplot(data = rfFit)+
+  geom_line(color = "royalblue3") + 
+  geom_point(color = "royalblue4")
+
+
+### budowa modelu
+
+df <- df %>%
+  mutate(
+    y = case_when(
+      y == "yes"~ 1,
+      y == "no"~ 0
+    )
+  )
+df$y <- as.factor(df$y)
+
+### podzial danych na zbior treningowy, walidacyjny i testowy do budowy 3 modeli
+
+# ustawianie ziarna losowego
+set.seed(12345)
+
+df$split <- runif(nrow(df), 0, 1)
+
+df <- df[order(df$split), ]
+
+df_train <- df[df$split<0.6, ]
+df_train <- df_train[, -16]
+
+df_test <- df[df$split>0.9, ]
+df_test <- df_test[, -16]
+
+df_valid <- df[(df$split>=0.6&df$split<=0.9), ]
+df_valid <- df_valid[, -16]
+
+# wyliczanie OOB (out-of-bag) error dla modeli z rozna liczba drzew
+oob_list <- c()
+tree_count <- c(100, 200, 500, 1000, 5000)
+for (ntree in tree_count){
+  model <- randomForest(x = df_train[, -15],
+                        y = df_train[, 15],
+                        ntree = ntree,
+                        mtry = rfFit$bestTune[[1]])
+  
+  oob_list <- append(oob_list, model$err.rate[, 1][length(model$err.rate[, 1])])
+  cat("model z ntree:", ntree, "zostal wyszkolony\n")
+}
+
+oob_list <- rbind(oob_list, tree_count)
+
+plot(oob_list[2, ], oob_list[1, ], log = "x")
+
+### budowa najlepszego modelu
+ntree <- tree_count[which(oob_list[1, ] == min(oob_list[1, ]))]
+
+model_final <- randomForest(x = df_train[, -15],
+                      y = df_train[, 15],
+                      ntree = ntree,
+                      mtry = rfFit$bestTune[[1]])
+
+# prognoza
+y_pred_test <-  predict(model_final, newdata = df_test[, -15])
+y_pred_valid <-  predict(model_final, newdata = df_valid[, -15])
+
+# obliczanie accuracy
+
+calculate_accuracy <- function(y_obs, y_pred){
+  error <- 0
+  for (i in 1:length(y_obs)){
+    if(y_obs[i] != y_pred[i]){
+      error <- error + 1
+    }
+  }
+  accuracy <- 1 - (error/length(y_obs))
+  print(accuracy)
+}
+
+calculate_accuracy(df_test[, 15], y_pred_test)
+calculate_accuracy(df_valid[, 15], y_pred_valid)
+
+### macierz pomylek
+
+confusionMatrix(y_pred_test, df_test[, 15], positive = "1")
+confusionMatrix(y_pred_valid, df_valid[, 15], positive = "1")
+
+### krzywa ROC finalnego modelu
+
+predictions <- as.data.frame(predict(model, df_test[, -15], type = "prob"))
+predictions$predict <- names(predictions)[1:2][apply(predictions[, 1:2], 1, which.max)]
+predictions$observed <- df_test[, 15]
+
+roc.test_smooth <- roc(predictions$observed, as.numeric(predictions$"1"), smooth = TRUE)
+roc.test <- roc(predictions$observed, as.numeric(predictions$"1"), smooth = FALSE)
+
+plot(roc.test, col = "red", xaxs = "i", yaxs = "i")
+grid()
+
+predictions <- as.data.frame(predict(model, df_valid[, -15], type = "prob"))
+predictions$predict <- names(predictions)[1:2][apply(predictions[, 1:2], 1, which.max)]
+predictions$observed <- df_valid[, 15]
+
+roc.valid <- roc(predictions$observed, as.numeric(predictions$"1"), smooth = FALSE)
+roc.valid_smooth <- roc(predictions$observed, as.numeric(predictions$"1"), smooth = TRUE)
+
+plot(roc.valid, col = "green", xaxs="i", yaxs="i")
+grid()
+
+plot(roc.test, col = "red", xaxs = "i", yaxs = "i")
+lines(roc.valid, col = "green")
+grid()
+
+plot(roc.test_smooth, col = "red", xaxs = "i", yaxs = "i")
+lines(roc.valid_smooth, col = "green")
+grid()
